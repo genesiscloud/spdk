@@ -58,6 +58,8 @@ struct bdev_rbd {
 	TAILQ_ENTRY(bdev_rbd) tailq;
 	struct spdk_poller *reset_timer;
 	struct spdk_bdev_io *reset_bdev_io;
+
+	uint64_t rbd_watch_handle;
 };
 
 struct bdev_rbd_io_channel {
@@ -87,6 +89,39 @@ struct bdev_rbd_cluster {
 static STAILQ_HEAD(, bdev_rbd_cluster) g_map_bdev_rbd_cluster = STAILQ_HEAD_INITIALIZER(
 			g_map_bdev_rbd_cluster);
 static pthread_mutex_t g_map_bdev_rbd_cluster_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct spdk_io_channel *bdev_rbd_get_io_channel(void *ctx);
+
+static void
+_rbd_update_callback(void* arg)
+{
+	struct bdev_rbd *rbd = arg;
+	uint64_t current_size_in_bytes = 0;
+	int rc;
+
+	struct spdk_io_channel *ch;
+	struct bdev_rbd_io_channel *rbd_io_ch;
+	ch = bdev_rbd_get_io_channel(&rbd->disk);
+	rbd_io_ch = spdk_io_channel_get_ctx(ch);
+	rc = rbd_get_size(rbd_io_ch->disk->image, &current_size_in_bytes);
+	spdk_put_io_channel(ch);
+	if (rc < 0) {
+	       SPDK_ERRLOG("Failed getting size %d\n", rc);
+	       return;
+	}
+
+	uint64_t known_size_in_bytes = rbd->disk.blocklen * rbd->disk.blockcnt;
+	rc = spdk_bdev_notify_blockcnt_change(&rbd->disk, current_size_in_bytes / rbd->disk.blocklen);
+	if (rc != 0) {
+	       SPDK_ERRLOG("failed to notify block cnt change.\n");
+	}
+}
+
+static void
+rbd_update_callback(void *arg)
+{
+	spdk_thread_send_msg(spdk_thread_get_app_thread(), _rbd_update_callback, arg);
+}
 
 static void
 bdev_rbd_cluster_free(struct bdev_rbd_cluster *entry)
@@ -155,6 +190,7 @@ bdev_rbd_free(struct bdev_rbd *rbd)
 	}
 
 	if (rbd->image) {
+		rbd_update_unwatch(rbd->image, rbd->rbd_watch_handle);
 		rbd_flush(rbd->image);
 		rbd_close(rbd->image);
 	}
@@ -400,6 +436,11 @@ bdev_rbd_init_context(void *arg)
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to open specified rbd device\n");
 		return NULL;
+	}
+
+	rc = rbd_update_watch(rbd->image, &rbd->rbd_watch_handle, rbd_update_callback, (void*)rbd);
+	if (rc < 0) {
+		SPDK_ERRLOG("Failed to set up watch %d\n", rc);
 	}
 
 	rc = rbd_stat(rbd->image, &rbd->info, sizeof(rbd->info));
